@@ -1,0 +1,25 @@
+{
+  "name": "wled-ble-control",
+  "version": "0.1.0",
+  "description": "BLE GATT control of WLED power, brightness, presets and nightlight, for the WledBleWear WearOS app.",
+  "keywords": [
+    "wled",
+    "ble",
+    "nimble",
+    "wearos",
+    "usermod"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JPChurchouse/WLED-BLE-Control-Usermod.git"
+  },
+  "platforms": "espressif32",
+  "build": {
+    "libArchive": false,
+    "extraScript": "tools/build_flags.py"
+  },
+  "dependencies": {
+    "h2zero/NimBLE-Arduino": "^2.3.0"
+  },
+  "license": "EUPL-1.2"
+}
