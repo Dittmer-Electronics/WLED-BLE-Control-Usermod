@@ -22,7 +22,7 @@ custom_usermods =
   symlink://C:/Users/Jamie/Git/WLED-BLE-Control-Usermod
 ```
 
-- The same file also defines `esp32c3dev_ble` and `esp32dev_ble_diag` (see Diagnostics).
+- The same file also defines `esp32c3dev_ble`, `esp32dev_ble_diag` and `esp32c3dev_ble_diag` (see Diagnostics). The BLE envs also symlink `C:/Users/Jamie/Git/WLED-Morse-Code-Usermod`, the user's Morse usermod, which the test devices run alongside this one.
 - Build from the WLED checkout with `~/.platformio/penv/Scripts/pio.exe run -e esp32dev_ble`. `pio` is not on PATH.
 - Current sizes (with audioreactive): ESP32 about 1.48 MB and C3 about 1.46 MB. Both fit WLED's default 1.5 MB app slot, so OTA updates work.
 - `big_partitions` (1.8 MB) is the fallback. Changing the partition table needs a USB flash and wipes the filesystem.
@@ -40,7 +40,7 @@ The test device is flashed over OTA: `curl -F "update=@.pio/build/<env>/firmware
 
 **Diagnostics** (in the `esp32dev_ble_diag` env):
 - `-D BLE_DEFER_START`: BLE starts only on `{"ble":{"start":true}}`, so a crashing init can't cause an OTA rollback. WLED only marks new firmware valid at the end of `setup()`.
-- `-D BLE_DIAG`: `BLE_LOG` lines go to RTC memory, which survives a panic. They appear in `/json/info` as "BLE log" (current) and "BLE last boot" (previous boot), along with the reset reason.
+- `-D BLE_DIAG`: `BLE_LOG` lines go to RTC memory, which survives a panic. They appear in `/json/info` as "BLE log" (current, newest entries kept) and "BLE last boot" (previous boot), along with the reset reason. `/json/info` also gets "BLE store" (entries per NimBLE store type, plus overflow and eviction counts) and "BLE nvs" (the keys in NimBLE's `nimble_bond` NVS namespace). Every build lists paired devices (count and address tails) under "BLE paired devices".
 
 ## Architecture
 
@@ -66,6 +66,10 @@ All the code is in `wled_ble_control.cpp`.
 - Advertising can still stop unexpectedly (seen when Windows retries a connection with stale keys), so `keepAdvertising()` restarts it every second while a connection slot is free.
 - The framework's `sdkconfig.h` fixes `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` at 1 and max bonds at 3.
 - The advert (flags + 128-bit UUID) fills the 31 bytes, so the name goes in the scan response.
+
+**Bond store overflows.** NimBLE's default store-status handler answers *any* store overflow by unpairing the oldest device. The CSFC store (GATT caching, type 8) holds a single entry, so each new pairing used to evict every other bonded device. The replacement handler (`StoreCallbacks`) first prunes records of devices that are no longer bonded. It unpairs only when the bond table itself is full, and otherwise skips the non-essential record. Confirmed on the C3 with the PC and watch both paired.
+
+**Config.** `readFromConfig` falls back to the current values for missing keys. A partial `/json/cfg` update such as `{"um":{"BLEControl":{"pairingWindowSec":600}}}` must not regenerate the passkey.
 
 **WiFi.** WLED's "disable WiFi sleep" setting (the default) is overridden (`noWifiSleep = false`) in `setup()` and every loop, because the WiFi driver aborts if power save is off while BT runs.
 

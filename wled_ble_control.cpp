@@ -25,6 +25,7 @@
 
 #include <NimBLEDevice.h>
 #include <esp_wifi.h>
+#include <nvs.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <vector>
@@ -271,9 +272,84 @@ struct Peer {
   bool cmdSub = false;
 };
 
+// Bond-store overflow handling.
+//
+// NimBLE's default handler (ble_store_util_status_rr) answers *any* store overflow
+// by unpairing the oldest device. But NimBLE leaves stale records behind (CCCDs and
+// RPA records of devices that are no longer bonded), so a subscription or address
+// record can overflow while the bond table has room, and every new pairing would
+// then unpair the others. Here stale records are pruned first, and a device is only
+// unpaired when the bond table really is full.
+// Deletes records of `type` that belong to devices no longer bonded. Returns how many.
+// The bonded list is read first: NimBLE store calls must not nest inside an iteration.
+static int pruneStaleRecords(int type) {
+  constexpr int MAX_STALE = 16;
+  struct Collect {
+    int type;
+    ble_addr_t bonded[CONFIG_BT_NIMBLE_MAX_BONDS];
+    int numBonded;
+    ble_addr_t stale[MAX_STALE];
+    int numStale;
+  } c{};
+  c.type = type;
+  ble_store_util_bonded_peers(c.bonded, &c.numBonded, CONFIG_BT_NIMBLE_MAX_BONDS);
+
+  ble_store_iterate(type, [](int t, union ble_store_value *v, void *arg) {
+    auto *c = (Collect *)arg;
+    const ble_addr_t &a = t == BLE_STORE_OBJ_TYPE_CCCD      ? v->cccd.peer_addr
+                        : t == BLE_STORE_OBJ_TYPE_PEER_ADDR ? v->rpa_rec.peer_addr
+                        : t == BLE_STORE_OBJ_TYPE_CSFC      ? v->csfc.peer_addr
+                                                            : v->sec.peer_addr;
+    for (int i = 0; i < c->numBonded; i++) {
+      if (!ble_addr_cmp(&c->bonded[i], &a)) return 0;
+    }
+    for (int i = 0; i < c->numStale; i++) {
+      if (!ble_addr_cmp(&c->stale[i], &a)) return 0;
+    }
+    if (c->numStale < MAX_STALE) c->stale[c->numStale++] = a;
+    return 0;
+  }, &c);
+
+  for (int i = 0; i < c.numStale; i++) {
+    union ble_store_key key;
+    memset(&key, 0, sizeof(key));
+    if (type == BLE_STORE_OBJ_TYPE_CCCD)           key.cccd.peer_addr = c.stale[i];
+    else if (type == BLE_STORE_OBJ_TYPE_PEER_ADDR) key.rpa_rec.peer_rpa_addr = c.stale[i];
+    else if (type == BLE_STORE_OBJ_TYPE_CSFC)      key.csfc.peer_addr = c.stale[i];
+    else                                           key.sec.peer_addr = c.stale[i];
+    ble_store_util_delete_all(type, &key);
+  }
+  return c.numStale;
+}
+
+class StoreCallbacks : public NimBLEDeviceCallbacks {
+public:
+  int lastOverflowType = 0;
+  int overflows = 0;
+  int evictions = 0;
+
+  int onStoreStatus(ble_store_status_event *event, void *arg) override {
+    if (event->event_code != BLE_STORE_EVENT_OVERFLOW) return ble_store_util_status_rr(event, arg);
+    int type = event->overflow.obj_type;
+    lastOverflowType = type;
+    overflows++;
+    int pruned = pruneStaleRecords(type);
+    BLE_LOG("BLE: store overflow type %d, bonds %d, pruned %d", type, NimBLEDevice::getNumBonds(), pruned);
+    if (pruned > 0) return 0;  // made room: retry the write
+    bool secType = type == BLE_STORE_OBJ_TYPE_OUR_SEC || type == BLE_STORE_OBJ_TYPE_PEER_SEC;
+    if (secType || NimBLEDevice::getNumBonds() >= CONFIG_BT_NIMBLE_MAX_BONDS) {
+      evictions++;
+      return ble_store_util_status_rr(event, arg);  // genuinely full: unpair the oldest
+    }
+    return BLE_HS_ESTORE_CAP;  // skip this non-essential record rather than unpair anyone
+  }
+};
+
 class BleControlUsermod : public Usermod,
                           public NimBLEServerCallbacks,
                           public NimBLECharacteristicCallbacks {
+  StoreCallbacks storeCallbacks;
+
   // Settings
   bool enabled = true;
   uint32_t passkey = 0;         // 6 digits; generated on first boot
@@ -373,7 +449,6 @@ class BleControlUsermod : public Usermod,
       if (authen) chr->notify(data, len, targets[i]);
       else BLE_LOG("skip notify h%u: not authenticated", targets[i]);
     }
-    if (!n) BLE_LOG("notify %s: no subscribers", stateChannel ? "state" : "cmd");
   }
 
   Peer *findPeer(uint16_t handle) {
@@ -488,7 +563,6 @@ class BleControlUsermod : public Usermod,
     }
 
     if (status == ST_OK && o.size() > 0) deserializeState(o, CALL_MODE_DIRECT_CHANGE);
-    BLE_LOG("BLE: cmd %02x arg %d -> %02x", c.op, c.arg, status);
     reply(c.connHandle, c.op, status);
   }
 
@@ -514,7 +588,9 @@ class BleControlUsermod : public Usermod,
   uint32_t onPassKeyDisplay() override { return passkey; }
 
   void onAuthenticationComplete(NimBLEConnInfo &info) override {
-    BLE_LOG("BLE: auth complete enc=%d authen=%d bonded=%d", info.isEncrypted(), info.isAuthenticated(), info.isBonded());
+    BLE_LOG("BLE: auth complete id %s ota %s enc=%d authen=%d bonded=%d bonds=%d",
+            info.getIdAddress().toString().c_str(), info.getAddress().toString().c_str(),
+            info.isEncrypted(), info.isAuthenticated(), info.isBonded(), NimBLEDevice::getNumBonds());
   }
 
   void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &info, uint16_t subValue) override {
@@ -574,6 +650,7 @@ class BleControlUsermod : public Usermod,
       return false;
     }
     applySecurity();
+    NimBLEDevice::setDeviceCallbacks(&storeCallbacks);
 
     server = NimBLEDevice::createServer();
     server->setCallbacks(this, false);
@@ -697,6 +774,15 @@ public:
 
     updateState();
     keepAdvertising();
+#ifdef BLE_DIAG
+    static int lastBonds = -1;
+    static uint32_t bondCheckMs = 0;
+    if (millis() - bondCheckMs > 500) {
+      bondCheckMs = millis();
+      int n = NimBLEDevice::getNumBonds();
+      if (n != lastBonds) { BLE_LOG("BLE: bonds %d -> %d", lastBonds, n); lastBonds = n; }
+    }
+#endif
   }
 
   void readFromJsonState(JsonObject &root) override {
@@ -718,6 +804,32 @@ public:
     lb.add(lastBootLog);
     JsonArray cl = user.createNestedArray(F("BLE log"));
     cl.add((const char *)rtcLog);
+
+    if (initDone) {  // entries per NimBLE store type (1 our sec, 2 peer sec, 3 cccd, 6 rpa rec, 7 local irk)
+      String counts;
+      for (int type : {1, 2, 3, 6, 7}) {
+        int n = 0;
+        ble_store_iterate(type, [](int, union ble_store_value *, void *arg) { (*(int *)arg)++; return 0; }, &n);
+        counts += String(type) + ':' + n + ' ';
+      }
+      counts += F("overflows:"); counts += storeCallbacks.overflows;
+      counts += F(" last:"); counts += storeCallbacks.lastOverflowType;
+      counts += F(" evictions:"); counts += storeCallbacks.evictions;
+      JsonArray st = user.createNestedArray(F("BLE store"));
+      st.add(counts);
+
+      // Keys actually persisted in NimBLE's NVS namespace.
+      String keys;
+      nvs_iterator_t it = nvs_entry_find("nvs", "nimble_bond", NVS_TYPE_ANY);
+      while (it) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        keys += info.key; keys += ' ';
+        it = nvs_entry_next(it);
+      }
+      JsonArray nk = user.createNestedArray(F("BLE nvs"));
+      nk.add(keys);
+    }
 #endif
 
     JsonArray line = user.createNestedArray(F("BLE"));
@@ -726,8 +838,17 @@ public:
     if (connected) { line.add(connected); line.add(F(" connected")); }
     else line.add(NimBLEDevice::getAdvertising()->isAdvertising() ? F("advertising") : F("idle"));
 
+    // Count plus the last 5 characters of each paired device's identity address.
     JsonArray bonds = user.createNestedArray(F("BLE paired devices"));
-    bonds.add(NimBLEDevice::getNumBonds());
+    int numBonds = NimBLEDevice::getNumBonds();
+    String list(numBonds);
+    for (int i = 0; i < numBonds; i++) {
+      std::string a = NimBLEDevice::getBondedAddress(i).toString();
+      list += i ? F(", ") : F(" (");
+      list += a.substr(a.size() > 5 ? a.size() - 5 : 0).c_str();
+    }
+    if (numBonds) list += ')';
+    bonds.add(list);
 
     JsonArray pairing = user.createNestedArray(F("BLE pairing"));
     if (pairingOpen) {
@@ -754,9 +875,11 @@ public:
   bool readFromConfig(JsonObject &root) override {
     JsonObject top = root[FPSTR(_name)];
     bool complete = !top.isNull();
-    complete &= getJsonValue(top[F("enabled")], enabled, true);
-    complete &= getJsonValue(top[F("passkey")], passkey, 0);
-    complete &= getJsonValue(top[F("pairingWindowSec")], pairWindowSec, 120);
+    // Missing keys keep their current values: a partial update through /json/cfg
+    // must not regenerate the passkey.
+    complete &= getJsonValue(top[F("enabled")], enabled, enabled);
+    complete &= getJsonValue(top[F("passkey")], passkey, passkey);
+    complete &= getJsonValue(top[F("pairingWindowSec")], pairWindowSec, pairWindowSec);
     bool forget = false;
     getJsonValue(top[F("forgetAllDevices")], forget, false);
 
