@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Build output, if built from a copy of WLED inside this folder
+.pio/
+build_output/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
